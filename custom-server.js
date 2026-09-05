@@ -46,6 +46,27 @@ function startBackgroundTokenRefreshFromCustomServer() {
     });
 }
 
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+  const reqHeaders = req.headers["access-control-request-headers"];
+  const allowOrigin = origin || "*";
+
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD");
+  res.setHeader("Access-Control-Allow-Headers", reqHeaders || "*");
+  res.setHeader("Access-Control-Expose-Headers", "*");
+
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    const currentVary = res.getHeader("Vary");
+    if (!currentVary) {
+      res.setHeader("Vary", "Origin");
+    } else if (typeof currentVary === "string" && !currentVary.split(/,\s*/).includes("Origin")) {
+      res.setHeader("Vary", currentVary + ", Origin");
+    }
+  }
+}
+
 // Wrap Next standalone HTTP server: derive client IP from the TCP socket
 // (unspoofable) and strip client-supplied forwarding headers so downstream
 // rate-limiting keys on the real peer address instead of attacker-controlled XFF.
@@ -54,6 +75,45 @@ http.createServer = (...args) => {
   const rest = args.filter((a) => typeof a !== "function");
   if (!handler) return origCreate(...args);
   const wrapped = (req, res) => {
+    // Handle CORS preflight OPTIONS requests immediately
+    if (req.method === "OPTIONS") {
+      applyCors(req, res);
+      res.setHeader("Access-Control-Max-Age", "86400");
+      res.setHeader("Content-Length", "0");
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+
+    // Ensure CORS headers on all HTTP responses
+    applyCors(req, res);
+
+    const origWriteHead = res.writeHead.bind(res);
+    res.writeHead = function (statusCode, ...rest) {
+      applyCors(req, res);
+      const headersIdx = rest.findIndex((arg) => arg && typeof arg === "object" && !Array.isArray(arg));
+      if (headersIdx !== -1) {
+        const extra = rest[headersIdx];
+        const origin = req.headers.origin;
+        extra["Access-Control-Allow-Origin"] = origin || "*";
+        extra["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD";
+        extra["Access-Control-Allow-Headers"] = req.headers["access-control-request-headers"] || "*";
+        extra["Access-Control-Expose-Headers"] = "*";
+        if (origin) {
+          extra["Access-Control-Allow-Credentials"] = "true";
+        }
+      }
+      return origWriteHead(statusCode, ...rest);
+    };
+
+    const origSetHeader = res.setHeader.bind(res);
+    res.setHeader = function (name, value) {
+      if (typeof name === "string" && name.toLowerCase() === "access-control-allow-origin" && req.headers.origin) {
+        return origSetHeader(name, req.headers.origin);
+      }
+      return origSetHeader(name, value);
+    };
+
     const socketIp = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "";
     const xff = req.headers["x-forwarded-for"];
     const xRealIp = req.headers["x-real-ip"];

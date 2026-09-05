@@ -191,42 +191,82 @@ function isPublicApi(pathname) {
   return PUBLIC_API_PATHS.some((p) => pathname === p || pathname.startsWith(`${p}/`));
 }
 
+function getCorsHeaders(request) {
+  const origin = request?.headers?.get?.("origin") || request?.headers?.origin;
+  const reqHeaders = request?.headers?.get?.("access-control-request-headers") || request?.headers?.["access-control-request-headers"];
+  const allowOrigin = origin || "*";
+  const headers = {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD",
+    "Access-Control-Allow-Headers": reqHeaders || "*",
+    "Access-Control-Expose-Headers": "*",
+  };
+  if (origin) {
+    headers["Access-Control-Allow-Credentials"] = "true";
+    headers["Vary"] = "Origin";
+  }
+  return headers;
+}
+
+function withCors(res, request) {
+  if (!res || !res.headers || typeof res.headers.set !== "function") return res;
+  const corsHeaders = getCorsHeaders(request);
+  for (const [key, value] of Object.entries(corsHeaders)) {
+    if (!res.headers.get(key)) {
+      res.headers.set(key, value);
+    }
+  }
+  return res;
+}
+
 export const __test__ = {
   isLocalRequest,
   isPublicLlmApi,
   extractApiKey,
   canAccessPublicLlmApi,
   canAccessLocalOnlyRoute,
+  getCorsHeaders,
 };
 
 export async function proxy(request) {
+  // Handle CORS preflight for all origins
+  if (request?.method === "OPTIONS") {
+    return new NextResponse(null, {
+      status: 204,
+      headers: {
+        ...getCorsHeaders(request),
+        "Access-Control-Max-Age": "86400",
+      },
+    });
+  }
+
   const { pathname } = request.nextUrl;
 
   // Local-only gate for spawn-capable / host-secret routes.
   if (LOCAL_ONLY_PATHS.some((p) => pathname.startsWith(p))) {
     if (!(await canAccessLocalOnlyRoute(request))) {
-      return NextResponse.json({ error: "Local only: CLI token required" }, { status: 403 });
+      return withCors(NextResponse.json({ error: "Local only: CLI token required" }, { status: 403, headers: getCorsHeaders(request) }), request);
     }
   }
 
   // Always protected - require valid JWT or local CLI token (machineId-based)
   if (ALWAYS_PROTECTED.some((p) => pathname.startsWith(p))) {
     if (await hasValidCliToken(request) || await hasValidToken(request))
-      return NextResponse.next();
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return withCors(NextResponse.next(), request);
+    return withCors(NextResponse.json({ error: "Unauthorized" }, { status: 401, headers: getCorsHeaders(request) }), request);
   }
 
   if (isPublicLlmApi(pathname)) {
-    if (await canAccessPublicLlmApi(request)) return NextResponse.next();
-    return NextResponse.json({ error: "API key required for remote API access" }, { status: 401 });
+    if (await canAccessPublicLlmApi(request)) return withCors(NextResponse.next(), request);
+    return withCors(NextResponse.json({ error: "API key required for remote API access" }, { status: 401, headers: getCorsHeaders(request) }), request);
   }
 
   // Deny-by-default for /api/* — public allow-list bypasses, everything else requires auth.
   if (pathname.startsWith("/api/")) {
-    if (isPublicApi(pathname)) return NextResponse.next();
+    if (isPublicApi(pathname)) return withCors(NextResponse.next(), request);
     if (await hasValidCliToken(request) || await isAuthenticated(request))
-      return NextResponse.next();
-    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+      return withCors(NextResponse.next(), request);
+    return withCors(NextResponse.json({ error: "Unauthorized" }, { status: 401, headers: getCorsHeaders(request) }), request);
   }
 
   // Protect all dashboard routes

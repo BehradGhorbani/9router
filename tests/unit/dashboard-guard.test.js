@@ -1,23 +1,35 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const mocks = vi.hoisted(() => ({
-  nextResponse: Symbol("next"),
-  jsonResponse: vi.fn((body, init) => ({
+const mocks = vi.hoisted(() => {
+  const MockNextResponse = vi.fn(function (body, init) {
+    this.status = init?.status || 200;
+    this.body = body;
+    this.headers = new Headers(init?.headers);
+  });
+  const jsonFn = vi.fn((body, init) => ({
     status: init?.status || 200,
     body,
-  })),
-  getSettings: vi.fn(),
-  validateApiKey: vi.fn(),
-  getConsistentMachineId: vi.fn(),
-  verifyDashboardAuthToken: vi.fn(),
-}));
+    headers: init?.headers,
+  }));
+  const nextFn = vi.fn(() => mocks.nextResponse);
+  const redirectFn = vi.fn((url) => ({ status: 307, url }));
+  MockNextResponse.next = nextFn;
+  MockNextResponse.json = jsonFn;
+  MockNextResponse.redirect = redirectFn;
+
+  return {
+    MockNextResponse,
+    nextResponse: Symbol("next"),
+    jsonResponse: jsonFn,
+    getSettings: vi.fn(),
+    validateApiKey: vi.fn(),
+    getConsistentMachineId: vi.fn(),
+    verifyDashboardAuthToken: vi.fn(),
+  };
+});
 
 vi.mock("next/server", () => ({
-  NextResponse: {
-    next: vi.fn(() => mocks.nextResponse),
-    json: mocks.jsonResponse,
-    redirect: vi.fn((url) => ({ status: 307, url })),
-  },
+  NextResponse: mocks.MockNextResponse,
 }));
 
 vi.mock("@/lib/localDb", () => ({
@@ -306,3 +318,70 @@ describe("dashboard guard helpers", () => {
     expect(__test__.extractApiKey(apiRequest)).toBe("header-key");
   });
 });
+
+describe("dashboard guard CORS handling", () => {
+  function optionsRequest(pathname, headers = {}) {
+    const req = request(pathname, headers);
+    req.method = "OPTIONS";
+    return req;
+  }
+
+  it("returns 204 with wildcard CORS headers for OPTIONS without Origin", async () => {
+    const response = await proxy(optionsRequest("/v1/chat/completions"));
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(response.headers.get("Access-Control-Allow-Methods")).toContain("POST");
+    expect(response.headers.get("Access-Control-Allow-Headers")).toBe("*");
+    expect(response.headers.get("Access-Control-Max-Age")).toBe("86400");
+  });
+
+  it("returns 204 with reflected Origin and credentials for OPTIONS with Origin", async () => {
+    const response = await proxy(optionsRequest("/v1/chat/completions", {
+      origin: "https://chatboxai.app",
+      "access-control-request-headers": "authorization, content-type",
+    }));
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("https://chatboxai.app");
+    expect(response.headers.get("Access-Control-Allow-Credentials")).toBe("true");
+    expect(response.headers.get("Access-Control-Allow-Headers")).toBe("authorization, content-type");
+    expect(response.headers.get("Vary")).toBe("Origin");
+  });
+
+  it("handles OPTIONS for protected /api routes without requiring authentication", async () => {
+    const response = await proxy(optionsRequest("/api/models", {
+      origin: "http://localhost:3000",
+    }));
+
+    expect(response.status).toBe(204);
+    expect(response.headers.get("Access-Control-Allow-Origin")).toBe("http://localhost:3000");
+    expect(response.headers.get("Access-Control-Allow-Credentials")).toBe("true");
+  });
+
+  it("includes CORS headers on 401 unauthorized responses", async () => {
+    const req = request("/api/v1/chat/completions", {
+      host: "router.example.com",
+      origin: "https://chatboxai.app",
+    });
+
+    const response = await proxy(req);
+
+    expect(response.status).toBe(401);
+    expect(response.headers?.["Access-Control-Allow-Origin"]).toBe("https://chatboxai.app");
+    expect(response.headers?.["Access-Control-Allow-Credentials"]).toBe("true");
+  });
+
+  it("includes CORS headers on 403 local-only forbidden responses", async () => {
+    const req = request("/api/mcp/filesystem/sse", {
+      host: "router.example.com",
+      origin: "http://evil.example.com",
+    });
+
+    const response = await proxy(req);
+
+    expect(response.status).toBe(403);
+    expect(response.headers?.["Access-Control-Allow-Origin"]).toBe("http://evil.example.com");
+  });
+});
+
